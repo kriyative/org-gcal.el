@@ -123,7 +123,7 @@
 
 (defconst org-gcal-events-url "https://www.googleapis.com/calendar/v3/calendars/%s/events")
 
-(defun org-gcal-sync (&optional a-token skip-export silent)
+(defun org-gcal-sync (&optional a-token skip-export silent callnext)
   (interactive)
   (org-gcal--ensure-token)
   (when org-gcal-auto-archive
@@ -174,31 +174,37 @@
                       ;; takes care of that step.
                       ((eq 401 (or (plist-get (plist-get (request-response-data response) :error) :code)
                                    status))
-                         (org-gcal--notify
-                          "Received HTTP 401"
-                          "OAuth token expired. Now trying to refresh-token")
-                         (deferred:next
-                           (lambda()
-                             (org-gcal-refresh-token 'org-gcal-sync skip-export))))
+                       (org-gcal--notify
+                        "Received HTTP 401"
+                        "OAuth token expired. Now trying to refresh-token")
+                       (deferred:next
+                         (lambda()
+                           (org-gcal-refresh-token
+                            (lambda (access-token)
+                              (org-gcal-sync access-token skip-export silent callnext))))))
                       ((eq 403 status)
-                         (org-gcal--notify "Received HTTP 403"
-                                           "Ensure you enabled the Calendar API through the Developers Console, then try again.")
-                         (deferred:nextc it
-                           (lambda()
-                             (org-gcal-refresh-token 'org-gcal-sync skip-export))))
+                       (org-gcal--notify "Received HTTP 403"
+                                         "Ensure you enabled the Calendar API through the Developers Console, then try again.")
+                       (deferred:nextc it
+                         (lambda()
+                           (org-gcal-refresh-token
+                            (lambda (access-token)
+                              (org-gcal-sync access-token skip-export silent callnext))))))
                       ;; We got some 2xx response, but for some reason no
                       ;; message body.
                       ((and (> 299 status) (eq temp nil))
                        (org-gcal--notify 
                         (concat "Received HTTP" (number-to-string status)) 
-                        "Error occured, but no message body."))
+                        "Error occured, but no message body.")
+                       (when callnext (funcall callnext)))
                       ((not (eq error-msg nil))
                        ;; Generic error-handler meant to provide useful
                        ;; information about failure cases not otherwise
                        ;; explicitly specified.
-                         (org-gcal--notify 
-                          (concat "Status code: " (number-to-string status))
-                          (pp-to-string error-msg)))
+                       (org-gcal--notify
+                        (concat "Status code: " (number-to-string status))
+                        (pp-to-string error-msg))
+                       (when callnext (funcall callnext)))
                       ;; Fetch was successful.
                       (t
                        (with-current-buffer (find-file-noselect (cdr x))
@@ -212,14 +218,15 @@
                                             (not (string= (cdr local-event)
                                                           (cdr (assoc (caar local-event)
                                                                       (with-current-buffer buf
-                                                                                        (plist-get (read (buffer-string)) (intern (concat ":" (car x))))))))))
+                                                                        (plist-get (read (buffer-string))
+                                                                                   (intern (concat ":" (car x))))))))))
                                       do
                                       (goto-char pos)
                                       (org-gcal-post-at-point t)
                                       finally
                                       (kill-buffer buf))
-                           (sit-for 2)
-                           (org-gcal-sync nil t t)))
+                             (sit-for 2)
+                             (org-gcal-sync nil t t)))
                          (erase-buffer)
                          (let ((items (org-gcal--filter (plist-get (request-response-data response) :items ))))
                            (insert
@@ -229,18 +236,23 @@
                                                items) ""))
                            (let ((plst (with-temp-buffer (insert-file-contents org-gcal-token-file)
                                                          (read (buffer-string)))))
-                             (with-temp-file org-gcal-token-file (pp (plist-put plst (intern (concat ":" (car x))) (mapcar (lambda (lst)
-                                                                                                                             (cons (plist-get lst :id) (org-gcal--cons-list lst)))
-                                                                                                                           items)) (current-buffer)))))
+                             (with-temp-file org-gcal-token-file
+                               (pp (plist-put plst (intern (concat ":" (car x)))
+                                              (mapcar (lambda (lst)
+                                                        (cons (plist-get lst :id) (org-gcal--cons-list lst)))
+                                                      items))
+                                   (current-buffer)))))
                          (org-set-startup-visibility)
                          (save-buffer))
                        (unless silent
-                       (org-gcal--notify "Completed event fetching ." (concat "Fetched data overwrote\n" (cdr x)))))))))))))
+                         (org-gcal--notify "Completed event fetching ."
+                                           (concat "Fetched data overwrote " (cdr x))))
+                       (when callnext (funcall callnext)))))))))))
 
-(defun org-gcal-fetch ()
+(defun org-gcal-fetch (&optional silent callnext)
   "Fetch event data from google calendar."
   (interactive)
-  (org-gcal-sync nil t))
+  (org-gcal-sync nil t silent callnext))
 
 (defun org-gcal--filter (items)
   "If `org-gcal-fetch-event-filters' has a list of functions,
@@ -251,7 +263,8 @@
        (lambda (item)
          (and (member nil
                       (mapcar (lambda (filter-func)
-                                (funcall filter-func item)) org-gcal-fetch-event-filters))
+                                (funcall filter-func item))
+                              org-gcal-fetch-event-filters))
               t))
        items)
     items))
@@ -365,7 +378,7 @@ It returns the code provided by the service."
    (cl-function (lambda (&key error-thrown &allow-other-keys)
                 (message "Got error: %S" error-thrown)))))
 
-(defun org-gcal-refresh-token (&optional fun skip-export start end smry loc desc id)
+(defun org-gcal-refresh-token (&optional callnext)
   "Refresh OAuth access at TOKEN-URL."
   (interactive)
     (deferred:$
@@ -390,12 +403,8 @@ It returns the code provided by the service."
             org-gcal-token-plist)))
       (deferred:nextc it
         (lambda (token)
-          (cond ((eq fun 'org-gcal-sync)
-                 (org-gcal-sync (plist-get token :access_token) skip-export))
-                ((eq fun 'org-gcal--post-event)
-                 (org-gcal--post-event start end smry loc desc id (plist-get token :access_token)))
-                ((eq fun 'org-gcal--delete-event)
-                 (org-gcal--delete-event id (plist-get token :access_token))))))))
+          (when callnext
+            (funcall callnext (plist-get token :access_token)))))))
 
 ;; Internal
 (defun org-gcal--archive-old-event ()
@@ -662,7 +671,9 @@ TO.  Instead an empty string is returned."
                      (org-gcal--notify
                       "Received HTTP 401"
                       "OAuth token expired. Now trying to refresh-token")
-                     (org-gcal-refresh-token 'org-gcal--post-event skip-export start end smry loc desc id)))
+                     (org-gcal-refresh-token
+                      (lambda (access-token)
+                        (org-gcal--post-event start end smry loc desc id access-token skip-export)))))
                   (t
                    (org-gcal--notify
                     (concat "Status code: " (pp-to-string status))
@@ -699,13 +710,15 @@ TO.  Instead an empty string is returned."
                      (org-gcal--notify
                       "Received HTTP 401"
                       "OAuth token expired. Now trying to refresh-token")
-                     (org-gcal-refresh-token 'org-gcal--delete-event skip-export nil nil nil nil nil event-id)))
+                     (org-gcal-refresh-token
+                      (lambda (access-token)
+                        (org-gcal--delete-event event-id access-token skip-import skip-export)))))
                   (t
                    (org-gcal--notify
                     (concat "Status code: " (pp-to-string status))
                     (pp-to-string error-msg)))))))
      :success (cl-function
-               (lambda (&key data &allow-other-keys)
+               (lambda (&key &allow-other-keys)
                  (progn
                    (org-gcal-fetch)
                    (org-gcal--notify "Event Deleted" "Org-gcal deleted event")))))))
@@ -726,7 +739,9 @@ TO.  Instead an empty string is returned."
            (setq org-gcal-token-plist
                  (with-temp-buffer
                    (insert-file-contents org-gcal-token-file)
-                   (plist-get (read (current-buffer)) :token))))) t)
+                   (plist-get (read (current-buffer)) :token))))
+         (not (null (plist-get org-gcal-token-plist :access_token))))
+    t)
    (t (org-gcal-request-token))))
 
 (defun org-gcal--timestamp-successor ()
@@ -752,7 +767,7 @@ beginning position."
             (alert mes :title title :icon file)
           (alert mes :title title))
       (deferred:$
-        (deferred:url-retrieve (concat "https://raw.githubusercontent.com/myuhe/org-gcal.el/master/" org-gcal-logo))
+        (deferred:url-retrieve (concat "https://raw.githubusercontent.com/kriyative/org-gcal.el/master/" org-gcal-logo))
         (deferred:nextc it
           (lambda (buf)
             (with-current-buffer buf
@@ -776,6 +791,44 @@ beginning position."
     (plist-get plst :mon)
     (plist-get plst :year))))
 
+
+(defvar org-gcal--multi-account-id nil)
+(defvar org-gcal--multi-accounts-fun nil)
+(defvar org-gcal--multi-accounts-cursor nil)
+
+(defun org-gcal--multi-do-next ()
+  (setq org-gcal--multi-accounts-cursor (cdr org-gcal--multi-accounts-cursor))
+  (when org-gcal--multi-accounts-cursor
+    (org-gcal--multi-do)))
+
+(defun org-gcal--multi-do ()
+  (let* ((i (car org-gcal--multi-accounts-cursor))
+         (acct (cdr i)))
+    (setq org-gcal--multi-account-id (car i)
+          org-gcal-client-id (assoc-cdr 'org-gcal-client-id acct)
+          org-gcal-client-secret (assoc-cdr 'org-gcal-client-secret acct)
+          org-gcal-file-alist (assoc-cdr 'org-gcal-file-alist acct)
+          org-gcal-token-file (assoc-cdr 'org-gcal-token-file acct)
+          org-gcal-token-plist nil
+          browse-url-browser-function 'browse-url-default-browser)
+    (message "org-gcal--multi-do: %S..." org-gcal--multi-account-id)
+    (funcall org-gcal--multi-accounts-fun)))
+
+(defun org-gcal--multi-fetch ()
+  (interactive)
+  (setq org-gcal--multi-accounts-cursor org-gcal-accounts
+        org-gcal--multi-accounts-fun
+        (lambda ()
+          (org-gcal-fetch nil 'org-gcal--multi-do-next)))
+  (org-gcal--multi-do))
+
+(defun org-gcal--multi-sync ()
+  (interactive)
+  (setq org-gcal--multi-accounts-cursor org-gcal-accounts
+        org-gcal--multi-accounts-fun
+        (lambda ()
+          (org-gcal-sync nil nil nil 'org-gcal--multi-do-next)))
+  (org-gcal--multi-do))
 
 (provide 'org-gcal)
 
